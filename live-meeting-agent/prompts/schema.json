@@ -1,0 +1,52 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["meeting_id", "started_at", "active_diagram_type", "pages"],
+  "properties": {
+    "meeting_id": {"type": "string"},
+    "started_at": {"type": "string"},
+    "active_diagram_type": {
+      "type": "string",
+      "enum": ["architecture", "process_flow", "mindmap", "sequence", "entity_model"]
+    },
+    "pages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "type", "role", "entities", "relations"],
+        "properties": {
+          "name": {"type": "string"},
+          "type": {"type": "string", "enum": ["architecture", "process_flow", "mindmap", "sequence", "entity_model"]},
+          "role": {"type": "string", "enum": ["live", "snapshot", "archived"]},
+          "entities": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["id", "label", "kind"],
+              "properties": {
+                "id": {"type": "string"},
+                "label": {"type": "string"},
+                "kind": {"type": "string", "enum": ["system", "role", "store", "actor", "process", "decision", "event"]},
+                "x": {"type": "integer"},
+                "y": {"type": "integer"}
+              }
+            }
+          },
+          "relations": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["id", "from", "to"],
+              "properties": {
+                "id": {"type": "string"},
+                "from": {"type": "string"},
+                "to": {"type": "string"},
+                "label": {"type": "string"}
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,5 @@
+14:02:00 So we want to design the new translation service. Customer-facing requests come into D365.
+14:02:30 D365 sends them to the MT Proxy via HTTPS, then the proxy hands them off to the Translator service.
+14:03:00 The translator returns the response back through the proxy to D365. We need a cache somewhere.
+14:03:30 Let's put a Redis store between the proxy and the translator for caching translations.
+14:04:00 D365 also writes audit logs to a SQL audit store.

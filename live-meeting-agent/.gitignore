@@ -1,0 +1,41 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+meetings/
+*.egg-info/
+dist/
+build/
+.vscode/
+
+# Audio fixtures and recordings – never commit
+*.wav
+*.mp3
+*.ogg
+*.flac
+*.m4a
+
+# Local environment files
+.env.*
+*.env
+
+# Logs
+*.log
+
+# JetBrains IDE
+.idea/
+
+# whisp-rec runtime artefacts (under lma/capture/)
+lma/capture/.whisp-rec.lock
+_smoke/
+
+# Recordings + transcript sidecars (data, now inside the tool folder)
+recordings/
+
+# Commit the built frontend bundle so the UI runs without a Node build
+!lma/server/frontend/dist/

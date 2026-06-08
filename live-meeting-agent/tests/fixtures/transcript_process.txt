@@ -1,0 +1,4 @@
+14:10:00 Let's walk through the customer onboarding flow.
+14:10:30 Customer fills the registration form. Then the system validates the email.
+14:11:00 If valid, we create the account in D365. Otherwise we send a "please retry" email.
+14:11:30 After account creation, we send the welcome email and create the audit log entry.
