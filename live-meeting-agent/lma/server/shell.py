@@ -37,13 +37,15 @@ class ServerThread(threading.Thread):
         return f"http://{self.host}:{self.port}"
 
 
-def run_window(app, host: str = "127.0.0.1", port: int = 8731, title: str = "Live Meeting Agent") -> None:
+def run_window(app, host: str = "127.0.0.1", port: int = 8731, title: str = "Live Meeting Agent",
+               js_api=None, width: int = 520, height: int = 820) -> None:
     """Start the server in a thread and open a pywebview window at its URL.
-    Blocks until the window is closed."""
+    Blocks until the window is closed. `js_api` is exposed to the page as
+    window.pywebview.api (the archive uses it for native 'Save As' export)."""
     server = ServerThread(app, host, port)
     server.start()
     time.sleep(0.8)  # let uvicorn bind
     import webview
-    webview.create_window(title, server.url, width=520, height=820)
+    webview.create_window(title, server.url, width=width, height=height, js_api=js_api)
     webview.start()
     server.stop()

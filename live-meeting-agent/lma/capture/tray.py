@@ -106,6 +106,15 @@ def free_space_gb(path: Path) -> float:
         return float("inf")
 
 
+def is_trivial_recording(duration: float, seg_count: int, max_seconds: float, max_segments: int) -> bool:
+    """An accidental recording: too short, or almost nothing said in a short clip.
+    Clips shorter than max_seconds are always trivial; the 'few messages' rule only
+    applies to clips under 4x that, so a long real meeting is never auto-deleted."""
+    short = duration < max_seconds
+    sparse = seg_count <= max_segments and duration < max_seconds * 4
+    return short or sparse
+
+
 def parse_hotkey(spec: str) -> tuple[int, int]:
     """Parse 'ctrl+alt+r' into (modifiers, vk_code). Raises on invalid input."""
     parts = [p.strip().lower() for p in spec.split("+") if p.strip()]
@@ -164,6 +173,7 @@ class WhispRecApp:
         ))
 
         # Teams autodetect state
+        self.auto_enabled = bool(config.get("auto_record_enabled", True))  # persisted on/off
         self.teams_active_streak = 0
         self.teams_inactive_streak = 0
         self.teams_seen_during_recording: bool = False
@@ -250,6 +260,32 @@ class WhispRecApp:
         elif recording:
             self.overlay.show()
 
+    def toggle_auto_enabled(self) -> None:
+        """Master on/off for auto-record, toggled from the tray menu. The tray
+        icon stays put either way - only the Teams auto-detect is paused/resumed.
+        Manual hotkey recording still works while paused."""
+        self.auto_enabled = not self.auto_enabled
+        log.info("auto-record %s via menu", "ENABLED" if self.auto_enabled else "PAUSED")
+        self._save_auto_enabled()
+        if not self.auto_enabled:
+            with self.state_lock:
+                recording_auto = self.state == State.RECORDING_AUTO
+            if recording_auto:
+                self._stop()  # stop the in-progress auto recording when pausing
+        self._refresh_icon()
+
+    def _save_auto_enabled(self) -> None:
+        """Persist the auto-record on/off choice to config.json so it survives a
+        sign-out / PC restart. The tray process itself always stays running."""
+        try:
+            cfg = load_config()
+            cfg["auto_record_enabled"] = self.auto_enabled
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+        except Exception:
+            log.exception("could not persist auto_record_enabled")
+
     def _start(self, target: State) -> None:
         free = free_space_gb(Path(self.config["output_dir"]))
         if free < float(self.config.get("min_free_gb_warning", 1)):
@@ -291,28 +327,60 @@ class WhispRecApp:
         self._set_state(target)
 
     def _stop(self) -> None:
+        duration = self.recorder.elapsed_seconds
         path = self.recorder.stop()
         self.recorder.set_tap(None)
-        # Tear the live session down OFF the caller's thread: brain.stop() can
-        # block for tens of seconds finishing an in-flight whisper utterance.
-        # We must hide the REC overlay and free the tray immediately, not after.
+        # Finish the live session OFF the caller's thread: brain.stop() can block
+        # for seconds finishing an in-flight utterance. Hide the REC overlay and
+        # free the tray immediately, not after.
         session = self._session
         self._session = None
         self.teams_seen_during_recording = False
         self._set_state(State.IDLE)  # hide overlay NOW, before slow teardown
+        threading.Thread(
+            target=self._finish_session, args=(session, path, duration),
+            name="lma-session-teardown", daemon=True,
+        ).start()
+
+    def _finish_session(self, session, path, duration) -> None:
+        # Stop the live brain/server first so the transcript jsonl is final before
+        # we decide whether to keep this recording.
         if session is not None:
-            threading.Thread(
-                target=self._teardown_session, args=(session,),
-                name="lma-session-teardown", daemon=True,
-            ).start()
+            try:
+                session.stop()
+            except Exception:
+                log.exception("live session stop failed")
+        if self._discard_if_trivial(path, duration):
+            return  # accidental/too-short recording deleted; nothing to transcribe
         if path and self.config.get("auto_transcribe", False):
             self._kick_transcription(path)
 
-    def _teardown_session(self, session) -> None:
-        try:
-            session.stop()
-        except Exception:
-            log.exception("live session stop failed")
+    def _discard_if_trivial(self, path, duration) -> bool:
+        """Delete an accidental recording (too short / almost nothing said) so it
+        never reaches the archive. Returns True if it was discarded."""
+        if not path or not self.config.get("discard_trivial", True):
+            return False
+        max_sec = float(self.config.get("discard_max_seconds", 15))
+        max_seg = int(self.config.get("discard_max_segments", 10))
+        flac = Path(path)
+        jsonl = flac.with_name(flac.stem + ".transcript.jsonl")
+        meta = flac.with_name(flac.stem + ".meta.json")
+        seg_count = 0
+        if jsonl.exists():
+            try:
+                seg_count = sum(1 for ln in jsonl.read_text(encoding="utf-8").splitlines() if ln.strip())
+            except Exception:
+                seg_count = 0
+        if not is_trivial_recording(duration, seg_count, max_sec, max_seg):
+            return False
+        for f in (flac, jsonl, meta):
+            try:
+                if f.exists():
+                    f.unlink()
+            except Exception:
+                log.exception("could not delete %s", f)
+        log.info("discarded trivial recording %s (%.1fs, %d segments)", flac.name, duration, seg_count)
+        return True
 
     def _kick_transcription(self, audio_path: Path) -> None:
         py = self.config.get("transcribe_python")
@@ -350,6 +418,20 @@ class WhispRecApp:
             )
         except Exception:
             log.exception("failed to open live transcript window")
+
+    def _open_archive_window(self) -> None:
+        """Open the Meeting Archive window (browse/search/chat past meetings)."""
+        port = int(self.config.get("archive_port", 8732))
+        pyw = SCRIPT_DIR.parent.parent / ".venv" / "Scripts" / "pythonw.exe"
+        exe = str(pyw) if pyw.exists() else sys.executable
+        try:
+            subprocess.Popen(
+                [exe, "-m", "lma.archive", "--port", str(port)],
+                cwd=str(SCRIPT_DIR.parent.parent),
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception:
+            log.exception("failed to open Meeting Archive window")
 
     # ------------------------------------------------------------------
     # Hotkey thread
@@ -445,7 +527,8 @@ class WhispRecApp:
             if active and current in (State.RECORDING_MANUAL, State.RECORDING_AUTO):
                 self.teams_seen_during_recording = True
 
-            if current == State.IDLE and active and self.teams_active_streak >= start_thresh:
+            if (current == State.IDLE and active and self.auto_enabled
+                    and self.teams_active_streak >= start_thresh):
                 if self.suppress_until_teams_ends:
                     log.debug("auto-detect suppressed (user stopped during current Teams call)")
                 else:
@@ -478,7 +561,7 @@ class WhispRecApp:
             s = self.state
         if s == State.IDLE:
             self.icon.icon = make_icon("gray")
-            self.icon.title = "whisp-rec (idle)"
+            self.icon.title = "whisp-rec (idle)" if self.auto_enabled else "whisp-rec (auto-record OFF)"
         elif s == State.RECORDING_MANUAL:
             self.icon.icon = make_icon("red")
             self.icon.title = f"whisp-rec (recording manual) {self.recorder.current_path}"
@@ -490,20 +573,23 @@ class WhispRecApp:
         def on_toggle(_icon, _item):
             self.toggle_manual()
 
+        def on_toggle_auto(_icon, _item):
+            self.toggle_auto_enabled()
+
         def on_open_folder(_icon, _item):
             os.startfile(self.config["output_dir"])  # type: ignore[attr-defined]
 
         def on_open_log(_icon, _item):
             os.startfile(str(LOG_PATH))  # type: ignore[attr-defined]
 
-        def on_quit(_icon, _item):
-            self.shutdown()
-
         def on_toggle_overlay(_icon, _item):
             self.toggle_overlay_hidden()
 
         def on_open_ui(_icon, _item):
             self._open_ui_window()
+
+        def on_open_archive(_icon, _item):
+            self._open_archive_window()
 
         def overlay_hidden(_item) -> bool:
             return self.overlay_suppressed
@@ -525,16 +611,20 @@ class WhispRecApp:
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
+                "Auto-record Teams calls",
+                on_toggle_auto,
+                checked=lambda item: self.auto_enabled,
+            ),
+            pystray.MenuItem(
                 "Hide overlay",
                 on_toggle_overlay,
                 checked=overlay_hidden,
                 enabled=self.overlay is not None,
             ),
-            pystray.MenuItem("Open live transcript", on_open_ui),
+            pystray.MenuItem("Open Live Agent", on_open_ui),
+            pystray.MenuItem("Open Meeting Archive", on_open_archive),
             pystray.MenuItem("Open recordings folder", on_open_folder),
             pystray.MenuItem("Open log file", on_open_log),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Quit", on_quit),
         )
 
     # ------------------------------------------------------------------
