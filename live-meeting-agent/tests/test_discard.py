@@ -1,4 +1,4 @@
-from lma.capture.tray import is_trivial_recording
+from lma.post.discard import is_trivial_recording
 
 
 def test_short_clip_is_trivial():

@@ -1,1 +1,1 @@
-"""Live UI server: WebSocket transcript hub + FastAPI app + pywebview shell."""
+"""Window shell (uvicorn thread + pywebview) used by the Meeting Archive."""

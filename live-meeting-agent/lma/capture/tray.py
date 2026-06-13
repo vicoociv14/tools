@@ -106,15 +106,6 @@ def free_space_gb(path: Path) -> float:
         return float("inf")
 
 
-def is_trivial_recording(duration: float, seg_count: int, max_seconds: float, max_segments: int) -> bool:
-    """An accidental recording: too short, or almost nothing said in a short clip.
-    Clips shorter than max_seconds are always trivial; the 'few messages' rule only
-    applies to clips under 4x that, so a long real meeting is never auto-deleted."""
-    short = duration < max_seconds
-    sparse = seg_count <= max_segments and duration < max_seconds * 4
-    return short or sparse
-
-
 def parse_hotkey(spec: str) -> tuple[int, int]:
     """Parse 'ctrl+alt+r' into (modifiers, vk_code). Raises on invalid input."""
     parts = [p.strip().lower() for p in spec.split("+") if p.strip()]
@@ -203,10 +194,6 @@ class WhispRecApp:
         # full-screen share without stopping the recording. Session-only.
         self.overlay_suppressed: bool = False
 
-        # Live brain/UI session (M4 auto-live). Best-effort: never breaks recording.
-        self._session = None
-        self._live_mode = str(config.get("live_brain", "off")).lower()
-
     # ------------------------------------------------------------------
     # State transitions
     # ------------------------------------------------------------------
@@ -291,37 +278,11 @@ class WhispRecApp:
         if free < float(self.config.get("min_free_gb_warning", 1)):
             log.warning("low disk space: %.2f GB free under %s", free, self.config["output_dir"])
 
-        # Live brain/UI (M4): attach the audio tap BEFORE recording starts so the
-        # brain sees audio from the first chunk. Entirely best-effort - any failure
-        # here must never stop the recording.
-        if self._live_mode in ("auto", "on"):
-            try:
-                from ..server.session import LiveSession
-                self._session = LiveSession(self.config)
-                self.recorder.set_tap(self._session.bus.push)
-            except Exception:
-                log.exception("live session setup failed; recording without live brain")
-                self._session = None
-                self.recorder.set_tap(None)
-
         try:
-            path = self.recorder.start()
+            self.recorder.start()
         except Exception:
             log.exception("recorder failed to start")
-            self.recorder.set_tap(None)
-            self._session = None
             return
-
-        if self._session is not None:
-            try:
-                self._session.start(path)
-            except Exception:
-                log.exception("live session failed to start; recording continues")
-                try:
-                    self._session.stop()
-                except Exception:
-                    log.debug("session stop after failed start raised", exc_info=True)
-                self._session = None
 
         self.teams_seen_during_recording = False
         self._set_state(target)
@@ -329,95 +290,36 @@ class WhispRecApp:
     def _stop(self) -> None:
         duration = self.recorder.elapsed_seconds
         path = self.recorder.stop()
-        self.recorder.set_tap(None)
-        # Finish the live session OFF the caller's thread: brain.stop() can block
-        # for seconds finishing an in-flight utterance. Hide the REC overlay and
-        # free the tray immediately, not after.
-        session = self._session
-        self._session = None
         self.teams_seen_during_recording = False
-        self._set_state(State.IDLE)  # hide overlay NOW, before slow teardown
-        threading.Thread(
-            target=self._finish_session, args=(session, path, duration),
-            name="lma-session-teardown", daemon=True,
-        ).start()
-
-    def _finish_session(self, session, path, duration) -> None:
-        # Stop the live brain/server first so the transcript jsonl is final before
-        # we decide whether to keep this recording.
-        if session is not None:
-            try:
-                session.stop()
-            except Exception:
-                log.exception("live session stop failed")
-        if self._discard_if_trivial(path, duration):
-            return  # accidental/too-short recording deleted; nothing to transcribe
-        if path and self.config.get("auto_transcribe", False):
-            self._kick_transcription(path)
-
-    def _discard_if_trivial(self, path, duration) -> bool:
-        """Delete an accidental recording (too short / almost nothing said) so it
-        never reaches the archive. Returns True if it was discarded."""
-        if not path or not self.config.get("discard_trivial", True):
-            return False
-        max_sec = float(self.config.get("discard_max_seconds", 15))
-        max_seg = int(self.config.get("discard_max_segments", 10))
-        flac = Path(path)
-        jsonl = flac.with_name(flac.stem + ".transcript.jsonl")
-        meta = flac.with_name(flac.stem + ".meta.json")
-        seg_count = 0
-        if jsonl.exists():
-            try:
-                seg_count = sum(1 for ln in jsonl.read_text(encoding="utf-8").splitlines() if ln.strip())
-            except Exception:
-                seg_count = 0
-        if not is_trivial_recording(duration, seg_count, max_sec, max_seg):
-            return False
-        for f in (flac, jsonl, meta):
-            try:
-                if f.exists():
-                    f.unlink()
-            except Exception:
-                log.exception("could not delete %s", f)
-        log.info("discarded trivial recording %s (%.1fs, %d segments)", flac.name, duration, seg_count)
-        return True
-
-    def _kick_transcription(self, audio_path: Path) -> None:
-        py = self.config.get("transcribe_python")
-        script = self.config.get("transcribe_script")
-        if not py or not script or not Path(py).exists() or not Path(script).exists():
-            log.warning("auto_transcribe on but python/script paths missing: py=%s script=%s", py, script)
+        self._set_state(State.IDLE)
+        if not path:
             return
-        cmd = [py, script, str(audio_path),
-               "--lang", self.config.get("transcribe_lang", "auto"),
-               "--model", self.config.get("transcribe_model", "large-v3-turbo")]
-        context = self.config.get("transcribe_context") or ""
-        if context:
-            cmd.extend(["--context", context])
-        log.info("dispatching transcription: %s", " ".join(cmd))
-        try:
-            subprocess.Popen(
-                cmd,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception:
-            log.exception("could not start transcription subprocess")
+        # Ultra-short recordings are accidental starts - delete immediately.
+        # (The post-transcription job applies the "almost nothing said" rule.)
+        if (self.config.get("discard_trivial", True)
+                and duration < float(self.config.get("discard_max_seconds", 15))):
+            try:
+                Path(path).unlink(missing_ok=True)
+                log.info("discarded trivial recording %s (%.1f s)", Path(path).name, duration)
+            except Exception:
+                log.exception("could not delete %s", path)
+            return
+        self._kick_post_transcription(path)
 
-    def _open_ui_window(self) -> None:
-        """Open (or re-open) the live transcript window, pointed at the server."""
-        port = int(self.config.get("server_port", 8731))
+    def _kick_post_transcription(self, audio_path) -> None:
+        """Spawn the post-meeting transcription job (Azure fast transcription ->
+        transcript.jsonl -> title) as a detached background process."""
         pyw = SCRIPT_DIR.parent.parent / ".venv" / "Scripts" / "pythonw.exe"
         exe = str(pyw) if pyw.exists() else sys.executable
         try:
             subprocess.Popen(
-                [exe, "-m", "lma.ui", "--port", str(port)],
+                [exe, "-m", "lma.post", str(audio_path)],
                 cwd=str(SCRIPT_DIR.parent.parent),
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
+            log.info("post-transcription job started for %s", Path(audio_path).name)
         except Exception:
-            log.exception("failed to open live transcript window")
+            log.exception("could not start post-transcription job")
 
     def _open_archive_window(self) -> None:
         """Open the Meeting Archive window (browse/search/chat past meetings)."""
@@ -585,9 +487,6 @@ class WhispRecApp:
         def on_toggle_overlay(_icon, _item):
             self.toggle_overlay_hidden()
 
-        def on_open_ui(_icon, _item):
-            self._open_ui_window()
-
         def on_open_archive(_icon, _item):
             self._open_archive_window()
 
@@ -621,7 +520,6 @@ class WhispRecApp:
                 checked=overlay_hidden,
                 enabled=self.overlay is not None,
             ),
-            pystray.MenuItem("Open Live Agent", on_open_ui),
             pystray.MenuItem("Open Meeting Archive", on_open_archive),
             pystray.MenuItem("Open recordings folder", on_open_folder),
             pystray.MenuItem("Open log file", on_open_log),
@@ -655,12 +553,6 @@ class WhispRecApp:
         self._shutdown.set()
         if self.recorder.is_recording:
             self.recorder.stop()
-        if self._session is not None:
-            try:
-                self._session.stop()
-            except Exception:
-                log.debug("session stop on shutdown raised", exc_info=True)
-            self._session = None
         if self.overlay is not None:
             self.overlay.stop()
         # Post WM_QUIT to the hotkey thread's message loop.

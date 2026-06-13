@@ -11,17 +11,14 @@ export default defineConfig({
   base: "./", // assets resolve when served by FastAPI at any root
   server: {
     proxy: {
-      "/api": "http://127.0.0.1:8731",
-      "/ws": { target: "ws://127.0.0.1:8731", ws: true },
+      "/api": "http://127.0.0.1:8732", // archive server
     },
   },
   build: {
     outDir: "dist",
     rollupOptions: {
       input: {
-        // live agent window
-        main: resolve(dir, "index.html"),
-        // meeting archive window (served by lma.archive on port 8732)
+        // the Meeting Archive is the only UI (served by `python -m lma.archive`)
         archive: resolve(dir, "archive.html"),
       },
     },

@@ -8,21 +8,15 @@ pycaw==20240210
 comtypes==1.4.5
 psutil==6.0.0
 pywin32==306
-# Audio bus
-scipy>=1.13
+# Post-meeting transcription (M7: Azure Speech fast transcription, batch REST)
+requests>=2.31
+# Meeting Archive (server + window)
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pywebview>=6.2
+# Titling + archive Q&A (Claude via Foundry)
+anthropic>=0.40
 # Tests
 pytest>=8.0
 pytest-mock>=3.12
 httpx>=0.27
-# Live transcription (M1: local whisper fallback)
-faster-whisper==1.2.1
-# Live transcription (M5: Azure Speech streaming STT - default backend, diarized DE/EN)
-azure-cognitiveservices-speech>=1.40
-# Live transcription (alt backend: OpenAI gpt-4o-transcribe on Azure Foundry)
-openai>=1.40
-# Live UI (M1 Part B)
-fastapi>=0.115
-uvicorn[standard]>=0.30
-pywebview>=6.2
-# Q&A (M2)
-anthropic>=0.40
